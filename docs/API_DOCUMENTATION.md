@@ -77,9 +77,9 @@ Handles claiming and reserving surplus food listings by recipient organizations.
 | Method | Proposed Endpoint | Access | Purpose / Description |
 |---|---|---|---|
 | `GET` | `/api/v1/reservations/` | Authenticated | List reservations relevant to the user/organization. |
-| `POST` | `/api/v1/reservations/` | Recipient | Create a reservation claim for an available food listing. |
+| `POST` | `/api/v1/reservations/` | Recipient | Create a reservation for an available food listing. |
 | `GET` | `/api/v1/reservations/{id}/` | Involved Parties | View specific reservation status and details. |
-| `PATCH` | `/api/v1/reservations/{id}/` | Involved Parties | Update reservation status (e.g., Confirm claim). |
+| `PATCH` | `/api/v1/reservations/{id}/` | Involved Parties | Update reservation status (e.g., Confirm reservation). |
 | `POST` | `/api/v1/reservations/{id}/cancel/` | Recipient / Donor | Cancel a pending reservation. |
 
 ### 3.5. Pickups & Deliveries (`/api/v1/deliveries/`)
