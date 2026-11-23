@@ -29,6 +29,7 @@ env/
 ENV/
 env.bak/
 venv.bak/
+venv_broken_backup/
 
 # Django specific
 *.log

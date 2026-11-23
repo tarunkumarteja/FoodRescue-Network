@@ -56,7 +56,7 @@ Below is the initial list of planned database entities for FoodRescueNetwork.
   - Timestamps: `created_at`, `updated_at`.
 
 ### 2.5. Reservation
-- **Description:** A formal claim made by an authorized Recipient organization on a `FoodListing`.
+- **Description:** A formal reservation made by an authorized Recipient organization on a `FoodListing`.
 - **Key Proposed Attributes:**
   - `id`, `food_listing` (FK to FoodListing).
   - `reserved_by` (FK to User / Organization).
