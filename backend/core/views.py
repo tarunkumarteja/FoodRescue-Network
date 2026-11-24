@@ -3,7 +3,7 @@ from datetime import timedelta
 from django.db import transaction
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
-from rest_framework import generics, status, views, viewsets
+from rest_framework import generics, status, views, viewsets, serializers
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -12,21 +12,33 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from .models import (
     User, Organization, FoodCategory, FoodListing, Reservation,
-    Pickup, DeliveryEvent, VerificationRecord, Feedback,
-    UserRole, OrgType, VerificationStatus, ListingStatus,
-    ReservationStatus, PickupStatus, DeliveryEventType
+    Pickup, DeliveryEvent, VerificationRecord, Feedback, Notification,
+    SimulationRun, UserRole, OrgType, VerificationStatus, ListingStatus,
+    ReservationStatus, PickupStatus, DeliveryEventType, NotificationType
 )
 from .serializers import (
     RegisterSerializer, UserProfileSerializer, OrganizationSerializer,
     FoodCategorySerializer, FoodListingSerializer, ReservationSerializer,
     PickupSerializer, DeliveryEventSerializer, VerificationRecordSerializer,
-    FeedbackSerializer
+    FeedbackSerializer, NotificationSerializer, SimulationRunSerializer
 )
 from .matching import (
     get_ranked_recipients_for_listing,
     get_recommended_listings_for_recipient,
     calculate_demand_forecast
 )
+from .safety import (
+    validate_donor_safety_compliance,
+    validate_recipient_claim_eligibility,
+    FoodSafetyValidationError
+)
+from .notifications import (
+    create_notification,
+    notify_new_matches,
+    notify_claim_confirmed,
+    notify_cancellation
+)
+from .simulation import run_network_simulation
 
 
 # ------------------------------------------------------------------------------
@@ -69,6 +81,34 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
         return self.request.user
 
 
+class UserAdminViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = User.objects.all().select_related('organization').order_by('-date_joined')
+    serializer_class = UserProfileSerializer
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=True, methods=['post'])
+    def toggle_suspend(self, request, pk=None):
+        if request.user.role != UserRole.ADMIN:
+            return Response({'error': 'Only platform administrators can suspend or unsuspend users.'}, status=status.HTTP_403_FORBIDDEN)
+
+        target_user = self.get_object()
+        target_user.is_suspended = not target_user.is_suspended
+        target_user.save()
+
+        state = "suspended" if target_user.is_suspended else "reinstated"
+        create_notification(
+            recipient=target_user,
+            notification_type=NotificationType.SYSTEM,
+            title=f"Account Status Update: {state.capitalize()}",
+            message=f"Your account has been {state} by a platform administrator."
+        )
+
+        return Response({
+            'message': f"User {target_user.username} has been {state}.",
+            'is_suspended': target_user.is_suspended
+        })
+
+
 # ------------------------------------------------------------------------------
 # 2. Organization Views
 # ------------------------------------------------------------------------------
@@ -91,8 +131,8 @@ class OrganizationViewSet(viewsets.ModelViewSet):
     def verify(self, request, pk=None):
         """Admin action to approve or reject an organization's verification."""
         org = self.get_object()
-        action_decision = request.data.get('decision', 'VERIFIED')  # VERIFIED or REJECTED
-        notes = request.data.get('notes', 'Reviewed and approved by platform admin.')
+        action_decision = request.data.get('decision', 'VERIFIED')
+        notes = request.data.get('notes', 'Reviewed and audited by platform admin.')
 
         if action_decision not in [VerificationStatus.VERIFIED, VerificationStatus.REJECTED]:
             return Response({'error': 'Invalid decision. Must be VERIFIED or REJECTED'}, status=status.HTTP_400_BAD_REQUEST)
@@ -102,7 +142,19 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         org.verified_by = request.user
         org.save()
 
-        # Update or record in VerificationRecord
+        # Update member status
+        for member in org.members.all():
+            member.is_verified = (action_decision == VerificationStatus.VERIFIED)
+            member.save(update_fields=['is_verified'])
+
+            create_notification(
+                recipient=member,
+                notification_type=NotificationType.SYSTEM,
+                title=f"Verification Decision: {action_decision}",
+                message=f"Organization verification for '{org.name}' was marked as {action_decision}. Notes: {notes}"
+            )
+
+        # Record in VerificationRecord
         VerificationRecord.objects.create(
             organization=org,
             submitted_by=org.members.first(),
@@ -119,7 +171,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
 
 
 class VerificationRecordListView(generics.ListAPIView):
-    queryset = VerificationRecord.objects.all().order_by('-created_at')
+    queryset = VerificationRecord.objects.all().select_related('organization', 'submitted_by', 'reviewed_by').order_by('-created_at')
     serializer_class = VerificationRecordSerializer
     permission_classes = [IsAuthenticated]
 
@@ -164,10 +216,28 @@ class FoodListingViewSet(viewsets.ModelViewSet):
 
         return qs
 
+    def perform_create(self, serializer):
+        user = self.request.user
+        # Food Safety & Policy Validation
+        try:
+            validate_donor_safety_compliance(user, serializer.validated_data)
+        except FoodSafetyValidationError as e:
+            raise serializers.ValidationError({'safety_error': e.message, 'code': e.code})
+
+        listing = serializer.save()
+
+        # Proactively find top matches and dispatch notifications
+        try:
+            matches = get_ranked_recipients_for_listing(listing)
+            if matches:
+                notify_new_matches(listing, matches[:3])
+        except Exception:
+            pass
+
     @action(detail=True, methods=['get'])
     def matches(self, request, pk=None):
         """
-        Runs the 4-factor Matching Algorithm (Slide 8):
+        Runs the 4-factor Matching Algorithm:
         Score = 0.4*D + 0.3*Q + 0.2*T + 0.1*C
         Ranks top verified recipient organizations.
         """
@@ -189,12 +259,14 @@ class FoodListingViewSet(viewsets.ModelViewSet):
         user = request.user
         org = user.organization
         if not org or org.organization_type != OrgType.RECIPIENT:
-            # Fallback or generic recipient evaluation
-            first_org = Organization.objects.filter(organization_type=OrgType.RECIPIENT).first()
+            first_org = Organization.objects.filter(
+                organization_type=OrgType.RECIPIENT,
+                verification_status=VerificationStatus.VERIFIED
+            ).first()
             if first_org:
                 org = first_org
             else:
-                return Response({'recommendations': []})
+                return Response({'recipient_organization': 'None', 'recommendations': []})
 
         recs = get_recommended_listings_for_recipient(org)
         return Response({
@@ -202,9 +274,29 @@ class FoodListingViewSet(viewsets.ModelViewSet):
             'recommendations': recs
         })
 
+    @action(detail=True, methods=['post'])
+    def review_safety(self, request, pk=None):
+        """Admin reviews food-safety declarations."""
+        if request.user.role != UserRole.ADMIN:
+            return Response({'error': 'Only platform administrators can review food-safety declarations.'}, status=status.HTTP_403_FORBIDDEN)
+
+        listing = self.get_object()
+        is_approved = request.data.get('approved', True)
+        notes = request.data.get('notes', 'Food safety declaration certified.')
+
+        listing.safety_reviewed = is_approved
+        listing.safety_review_notes = notes
+        listing.save(update_fields=['safety_reviewed', 'safety_review_notes'])
+
+        return Response({
+            'message': 'Food safety declaration review recorded.',
+            'safety_reviewed': listing.safety_reviewed,
+            'safety_review_notes': listing.safety_review_notes
+        })
+
 
 # ------------------------------------------------------------------------------
-# 5. Reservations & Atomic Reservation View
+# 5. Reservations & Atomic Claim Workflow
 # ------------------------------------------------------------------------------
 class ReservationViewSet(viewsets.ModelViewSet):
     serializer_class = ReservationSerializer
@@ -225,40 +317,31 @@ class ReservationViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         """
-        Atomic Reservation Workflow (Slide 8 & 9):
+        Atomic Reservation / Claim Workflow:
         Uses database transactions and row-level locking (select_for_update)
-        to prevent race conditions & double-booking.
+        to prevent race conditions & double-allocation under concurrent load.
         """
         listing_id = request.data.get('food_listing')
-        quantity_to_reserve = int(request.data.get('quantity_reserved', 0))
+        try:
+            quantity_to_reserve = int(request.data.get('quantity_reserved', 0))
+        except (ValueError, TypeError):
+            return Response({'error': 'Invalid quantity.'}, status=status.HTTP_400_BAD_REQUEST)
 
         if quantity_to_reserve <= 0:
             return Response({'error': 'Quantity to reserve must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Safety Check: Recipient organization must be verified
         recipient_user = request.user
-        if recipient_user.organization and recipient_user.organization.verification_status != VerificationStatus.VERIFIED:
-            return Response({
-                'error': 'Safety restriction: Only verified organizations are permitted to reserve food.'
-            }, status=status.HTTP_403_FORBIDDEN)
 
         try:
             with transaction.atomic():
-                # Acquire exclusive row lock on the listing
+                # Acquire exclusive row lock on the listing in PostgreSQL / DB
                 listing = FoodListing.objects.select_for_update().get(id=listing_id)
 
-                if listing.status in [ListingStatus.EXPIRED, ListingStatus.CANCELLED]:
-                    return Response({'error': 'This listing is no longer available.'}, status=status.HTTP_409_CONFLICT)
-
-                if listing.is_expired:
-                    listing.status = ListingStatus.EXPIRED
-                    listing.save()
-                    return Response({'error': 'The pickup deadline for this listing has expired.'}, status=status.HTTP_409_CONFLICT)
-
-                if listing.quantity < quantity_to_reserve:
-                    return Response({
-                        'error': f'Only {listing.quantity} {listing.unit_of_measure} remaining. Cannot reserve {quantity_to_reserve}.'
-                    }, status=status.HTTP_409_CONFLICT)
+                # Validate recipient eligibility and safety rules
+                try:
+                    validate_recipient_claim_eligibility(recipient_user, listing, quantity_to_reserve)
+                except FoodSafetyValidationError as ve:
+                    return Response({'error': ve.message, 'code': ve.code}, status=status.HTTP_400_BAD_REQUEST)
 
                 # Deduct inventory atomically
                 listing.quantity -= quantity_to_reserve
@@ -268,11 +351,11 @@ class ReservationViewSet(viewsets.ModelViewSet):
                     listing.status = ListingStatus.PARTIALLY_RESERVED
                 listing.save()
 
-                # Calculate expiration (e.g. 2 hours before pickup deadline or 4 hours from now)
+                # Calculate expiration
                 now = timezone.now()
                 expires_at = min(listing.pickup_deadline, now + timedelta(hours=3))
 
-                # Create Reservation
+                # Create Reservation / Claim
                 reservation = Reservation.objects.create(
                     food_listing=listing,
                     recipient=recipient_user,
@@ -295,8 +378,11 @@ class ReservationViewSet(viewsets.ModelViewSet):
                     pickup=pickup,
                     actor=recipient_user,
                     event_type=DeliveryEventType.VOLUNTEER_ASSIGNED,
-                    notes=f"Reservation created for {quantity_to_reserve} {listing.unit_of_measure}. Logistics dispatched."
+                    notes=f"Claim reserved for {quantity_to_reserve} {listing.unit_of_measure}. Logistics dispatched."
                 )
+
+                # Notify donor and recipient
+                notify_claim_confirmed(reservation)
 
                 serializer = ReservationSerializer(reservation)
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -308,7 +394,7 @@ class ReservationViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
-        """Cancel an existing reservation and restore inventory atomically."""
+        """Cancel an existing claim/reservation and restore inventory atomically."""
         reservation = self.get_object()
         reason = request.data.get('reason', 'Cancelled by user.')
 
@@ -330,7 +416,21 @@ class ReservationViewSet(viewsets.ModelViewSet):
                 reservation.pickup.status = PickupStatus.CANCELLED
                 reservation.pickup.save()
 
+                DeliveryEvent.objects.create(
+                    pickup=reservation.pickup,
+                    actor=request.user,
+                    event_type=DeliveryEventType.DELIVERY_FAILED,
+                    notes=f"Pickup cancelled. Reason: {reason}"
+                )
+
+            # In-app notifications
+            notify_cancellation(reservation, reason)
+
         return Response({'message': 'Reservation cancelled and inventory restored.'})
+
+
+# Domain alias
+ClaimViewSet = ReservationViewSet
 
 
 # ------------------------------------------------------------------------------
@@ -349,10 +449,6 @@ class PickupViewSet(viewsets.ModelViewSet):
         available_only = self.request.query_params.get('available')
         if available_only:
             return qs.filter(status=PickupStatus.PENDING, volunteer__isnull=True)
-
-        if user.role == UserRole.VOLUNTEER:
-            # show assignments or all
-            pass
 
         return qs
 
@@ -374,6 +470,14 @@ class PickupViewSet(viewsets.ModelViewSet):
             notes=f"Volunteer {request.user.get_full_name() or request.user.username} accepted delivery task."
         )
 
+        # Notify donor and recipient
+        create_notification(
+            recipient=pickup.reservation.food_listing.donor,
+            notification_type=NotificationType.PICKUP_ASSIGNED,
+            title="Volunteer Assigned for Pickup",
+            message=f"Volunteer {request.user.get_full_name() or request.user.username} has been assigned to collect '{pickup.reservation.food_listing.title}'."
+        )
+
         return Response({
             'message': 'Delivery assignment claimed successfully.',
             'pickup': PickupSerializer(pickup).data
@@ -382,20 +486,18 @@ class PickupViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def verify_donor_pickup(self, request, pk=None):
         """
-        Donor Handover Verification (Slide 6 & 12):
+        Donor Handover Verification:
         Volunteer inputs the 6-digit OTP provided by the Donor or scans QR code.
         """
         pickup = self.get_object()
         provided_otp = request.data.get('otp', '').strip()
         qr_token = request.data.get('qr_token', '').strip()
 
-        # Check OTP or QR
         if (provided_otp and provided_otp == pickup.donor_otp) or (qr_token and qr_token == pickup.qr_code_token):
             pickup.status = PickupStatus.PICKED_UP
             pickup.actual_pickup_time = timezone.now()
             pickup.save()
 
-            # Update food listing status
             listing = pickup.reservation.food_listing
             listing.status = ListingStatus.PICKED_UP
             listing.save()
@@ -405,6 +507,14 @@ class PickupViewSet(viewsets.ModelViewSet):
                 actor=request.user,
                 event_type=DeliveryEventType.FOOD_COLLECTED,
                 notes="Donor handover confirmed via OTP/QR verification. Food collected and en route."
+            )
+
+            # Notify recipient that food is collected and en route
+            create_notification(
+                recipient=pickup.reservation.recipient,
+                notification_type=NotificationType.FOOD_COLLECTED,
+                title="Food Collected & En Route",
+                message=f"Surplus food from '{listing.title}' has been collected by the volunteer and is en route to your facility."
             )
 
             return Response({
@@ -419,7 +529,7 @@ class PickupViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def verify_recipient_delivery(self, request, pk=None):
         """
-        Recipient Delivery Handover Verification (Slide 6 & 12):
+        Recipient Delivery Handover Verification:
         Volunteer or Recipient enters the 6-digit Recipient OTP or scans QR code.
         """
         pickup = self.get_object()
@@ -431,7 +541,6 @@ class PickupViewSet(viewsets.ModelViewSet):
             pickup.actual_delivery_time = timezone.now()
             pickup.save()
 
-            # Mark Reservation and Listing as completed
             reservation = pickup.reservation
             reservation.status = ReservationStatus.COMPLETED
             reservation.save()
@@ -448,6 +557,14 @@ class PickupViewSet(viewsets.ModelViewSet):
                 notes="Recipient handover confirmed via OTP/QR. Food delivery successfully completed."
             )
 
+            # Notify donor of completed delivery
+            create_notification(
+                recipient=listing.donor,
+                notification_type=NotificationType.DELIVERY_COMPLETED,
+                title="Delivery Completed!",
+                message=f"Your surplus donation of {reservation.quantity_reserved} {listing.unit_of_measure} has been successfully delivered and distributed to {reservation.organization.name if reservation.organization else 'Recipient'}."
+            )
+
             return Response({
                 'message': 'Delivery confirmed and verified! Food distributed.',
                 'pickup': PickupSerializer(pickup).data
@@ -458,8 +575,105 @@ class PickupViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_400_BAD_REQUEST)
 
 
+class DeliveryEventViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = DeliveryEvent.objects.all().select_related('pickup', 'actor').order_by('-timestamp')
+    serializer_class = DeliveryEventSerializer
+    permission_classes = [IsAuthenticated]
+
+
 # ------------------------------------------------------------------------------
-# 7. Analytics & Impact Dashboard Views (Slide 7 & 12)
+# 7. Notifications ViewSet
+# ------------------------------------------------------------------------------
+class NotificationViewSet(viewsets.ModelViewSet):
+    serializer_class = NotificationSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return Notification.objects.filter(recipient=self.request.user).order_by('-created_at')
+
+    @action(detail=True, methods=['post'])
+    def mark_read(self, request, pk=None):
+        notif = self.get_object()
+        notif.is_read = True
+        notif.save()
+        return Response({'message': 'Notification marked as read.'})
+
+    @action(detail=False, methods=['post'])
+    def mark_all_read(self, request):
+        Notification.objects.filter(recipient=request.user, is_read=False).update(is_read=True)
+        return Response({'message': 'All notifications marked as read.'})
+
+    @action(detail=False, methods=['get'])
+    def unread_count(self, request):
+        count = Notification.objects.filter(recipient=request.user, is_read=False).count()
+        return Response({'unread_count': count})
+
+
+# ------------------------------------------------------------------------------
+# 8. Feedback & Dispute Resolution
+# ------------------------------------------------------------------------------
+class FeedbackViewSet(viewsets.ModelViewSet):
+    queryset = Feedback.objects.all().select_related('author', 'target_organization', 'resolved_by').order_by('-created_at')
+    serializer_class = FeedbackSerializer
+    permission_classes = [IsAuthenticated]
+
+    def perform_create(self, serializer):
+        serializer.save(author=self.request.user)
+
+    @action(detail=True, methods=['post'])
+    def resolve(self, request, pk=None):
+        """Admin resolution of feedback or safety incident report."""
+        if request.user.role != UserRole.ADMIN:
+            return Response({'error': 'Only platform administrators can resolve disputes.'}, status=status.HTTP_403_FORBIDDEN)
+
+        feedback = self.get_object()
+        resolution_notes = request.data.get('notes', 'Reviewed and resolved by platform administrator.')
+
+        feedback.is_resolved = True
+        feedback.resolution_notes = resolution_notes
+        feedback.resolved_by = request.user
+        feedback.resolved_at = timezone.now()
+        feedback.save()
+
+        # Notify feedback author
+        create_notification(
+            recipient=feedback.author,
+            notification_type=NotificationType.SYSTEM,
+            title="Feedback / Report Resolved",
+            message=f"Your feedback regarding '{feedback.target_organization.name if feedback.target_organization else 'Organization'}' has been reviewed and resolved. Notes: {resolution_notes}"
+        )
+
+        return Response({
+            'message': 'Feedback issue resolved successfully.',
+            'feedback': FeedbackSerializer(feedback).data
+        })
+
+
+# ------------------------------------------------------------------------------
+# 9. Simulation & Benchmarking Views
+# ------------------------------------------------------------------------------
+class SimulationViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = SimulationRun.objects.all().order_by('-created_at')
+    serializer_class = SimulationRunSerializer
+    permission_classes = [AllowAny]
+
+    @action(detail=False, methods=['post'])
+    def run(self, request):
+        """Triggers multi-agent simulation & benchmarking."""
+        num_donors = int(request.data.get('donors', 5))
+        num_recipients = int(request.data.get('recipients', 8))
+        num_listings = int(request.data.get('listings', 12))
+
+        result = run_network_simulation(
+            num_donors=num_donors,
+            num_recipients=num_recipients,
+            num_listings=num_listings
+        )
+        return Response(result, status=status.HTTP_201_CREATED)
+
+
+# ------------------------------------------------------------------------------
+# 10. Analytics & Impact Dashboard Views
 # ------------------------------------------------------------------------------
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -481,14 +695,16 @@ def analytics_dashboard(request):
         status__in=[PickupStatus.PENDING, PickupStatus.ASSIGNED, PickupStatus.PICKED_UP]
     ).count()
 
-    # Carbon offset calculation (approx. 1.8 kg CO2 saved per kg/packet of food rescued)
     co2_saved_kg = round(total_packets_reserved * 1.8, 1)
 
-    # Categories breakdown
     categories = FoodCategory.objects.annotate(
         listings_count=Count('listings'),
         total_packets=Sum('listings__initial_quantity')
     ).values('name', 'listings_count', 'total_packets')
+
+    # Latest simulation metrics if available
+    latest_sim = SimulationRun.objects.first()
+    latest_sim_data = SimulationRunSerializer(latest_sim).data if latest_sim else None
 
     return Response({
         'impact_summary': {
@@ -506,6 +722,7 @@ def analytics_dashboard(request):
             }
         },
         'categories_distribution': list(categories),
+        'latest_simulation': latest_sim_data,
         'timestamp': timezone.now().isoformat()
     })
 
@@ -514,26 +731,14 @@ def analytics_dashboard(request):
 @permission_classes([AllowAny])
 def demand_forecast_view(request):
     """
-    Returns AI/predictive demand forecasting based on historical donation & reservation patterns.
+    Returns predictive demand forecasting based on historical donation & reservation patterns.
     """
     data = calculate_demand_forecast()
     return Response(data)
 
 
 # ------------------------------------------------------------------------------
-# 8. Feedback & Food Safety Incident Reporting
-# ------------------------------------------------------------------------------
-class FeedbackViewSet(viewsets.ModelViewSet):
-    queryset = Feedback.objects.all().order_by('-created_at')
-    serializer_class = FeedbackSerializer
-    permission_classes = [IsAuthenticated]
-
-    def perform_create(self, serializer):
-        serializer.save(author=self.request.user)
-
-
-# ------------------------------------------------------------------------------
-# 9. Seed Demo Data Endpoint (Slide 12 Demo Scenario)
+# 11. Seed Demo Data Endpoint
 # ------------------------------------------------------------------------------
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -575,11 +780,12 @@ def seed_demo_data(request):
     )
 
     # 2. Organizations
-    org_donor, _ = Organization.objects.get_or_create(
+    org_donor, _ = Organization.objects.update_or_create(
         name="Royal Spice Restaurant & Banquets",
         defaults={
             "organization_type": OrgType.DONOR,
             "registration_id": "GSTIN-29AAACR1234F1Z5",
+            "fssai_license": "FSSAI-11223344000123",
             "address": "12 Residency Road, Shanthala Nagar, Bengaluru",
             "city": "Bengaluru",
             "postal_code": "560025",
@@ -593,7 +799,7 @@ def seed_demo_data(request):
         }
     )
 
-    org_ngo1, _ = Organization.objects.get_or_create(
+    org_ngo1, _ = Organization.objects.update_or_create(
         name="Asha Jyothi Children Home & Shelter",
         defaults={
             "organization_type": OrgType.RECIPIENT,
@@ -604,6 +810,7 @@ def seed_demo_data(request):
             "latitude": 12.9634,
             "longitude": 77.6012,
             "capacity": 120,
+            "has_cold_storage": True,
             "contact_email": "ashajyothi@childrenhome.org",
             "contact_phone": "+91 94480 33445",
             "verification_status": VerificationStatus.VERIFIED,
@@ -611,7 +818,7 @@ def seed_demo_data(request):
         }
     )
 
-    org_ngo2, _ = Organization.objects.get_or_create(
+    org_ngo2, _ = Organization.objects.update_or_create(
         name="Karuna Community Kitchen & Care",
         defaults={
             "organization_type": OrgType.RECIPIENT,
@@ -622,6 +829,7 @@ def seed_demo_data(request):
             "latitude": 12.9784,
             "longitude": 77.6408,
             "capacity": 200,
+            "has_cold_storage": False,
             "contact_email": "contact@karunakitchen.org",
             "contact_phone": "+91 98800 77665",
             "verification_status": VerificationStatus.VERIFIED,
@@ -629,7 +837,7 @@ def seed_demo_data(request):
         }
     )
 
-    org_pending, _ = Organization.objects.get_or_create(
+    org_pending, _ = Organization.objects.update_or_create(
         name="Hope Horizon Shelter (Pending Review)",
         defaults={
             "organization_type": OrgType.RECIPIENT,
@@ -640,6 +848,7 @@ def seed_demo_data(request):
             "latitude": 12.9345,
             "longitude": 77.6256,
             "capacity": 80,
+            "has_cold_storage": False,
             "contact_email": "info@hopehorizon.org",
             "contact_phone": "+91 97711 22334",
             "verification_status": VerificationStatus.PENDING,
@@ -693,7 +902,6 @@ def seed_demo_data(request):
     )
 
     # 4. Slide 12 Demo Scenario:
-    # 50 packets listed -> 30 packets reserved -> 20 packets remaining -> 1 delivery completed
     demo_listing, _ = FoodListing.objects.get_or_create(
         title="Royal Buffet Surplus: Vegetable Biryani & Paneer Gravy",
         donor=donor_user,
@@ -705,6 +913,7 @@ def seed_demo_data(request):
             "initial_quantity": 50,      # 50 originally listed
             "unit_of_measure": "packets",
             "prepared_at": now - timedelta(hours=2),
+            "best_before_datetime": now + timedelta(hours=4),
             "pickup_deadline": now + timedelta(hours=3),
             "storage_condition": "Hot / Heated (>60°C)",
             "allergens_present": ["Dairy", "Nuts"],
@@ -713,7 +922,9 @@ def seed_demo_data(request):
             "pickup_address": "12 Residency Road, Shanthala Nagar, Bengaluru",
             "latitude": 12.9716,
             "longitude": 77.6006,
-            "status": ListingStatus.PARTIALLY_RESERVED
+            "status": ListingStatus.PARTIALLY_RESERVED,
+            "food_safety_declaration": "Certified hygienic preparation conforming to food safety standards.",
+            "safety_reviewed": True
         }
     )
 
@@ -780,6 +991,7 @@ def seed_demo_data(request):
             "initial_quantity": 40,
             "unit_of_measure": "packets",
             "prepared_at": now - timedelta(hours=4),
+            "best_before_datetime": now + timedelta(hours=8),
             "pickup_deadline": now + timedelta(hours=6),
             "storage_condition": "Room Temperature (Ambient)",
             "allergens_present": ["Gluten"],
@@ -788,7 +1000,9 @@ def seed_demo_data(request):
             "pickup_address": "12 Residency Road, Shanthala Nagar, Bengaluru",
             "latitude": 12.9716,
             "longitude": 77.6006,
-            "status": ListingStatus.AVAILABLE
+            "status": ListingStatus.AVAILABLE,
+            "food_safety_declaration": "Baked today with food-grade ingredients and sanitary packing.",
+            "safety_reviewed": True
         }
     )
 
@@ -802,6 +1016,20 @@ def seed_demo_data(request):
             "comments": "Excellent food quality! The biryani was still warm and nourished 30 children at our shelter.",
             "report_safety_issue": False
         }
+    )
+
+    # Initial notifications
+    create_notification(
+        recipient=recipient_user,
+        notification_type=NotificationType.DELIVERY_COMPLETED,
+        title="Demo Delivery Successful",
+        message="30 packets of Royal Buffet Surplus delivered to Asha Jyothi Children Home."
+    )
+    create_notification(
+        recipient=donor_user,
+        notification_type=NotificationType.NEW_MATCH,
+        title="High Match Rate Found",
+        message="Asha Jyothi Children Home matched with 86.0% compatibility for your lunch surplus."
     )
 
     return Response({
