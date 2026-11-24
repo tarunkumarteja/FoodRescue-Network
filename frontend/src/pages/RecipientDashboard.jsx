@@ -12,6 +12,14 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
   const [filterCategory, setFilterCategory] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
 
+  // Feedback & Safety Incident Reporting modal state
+  const [feedbackModalReservation, setFeedbackModalReservation] = useState(null);
+  const [feedbackRating, setFeedbackRating] = useState(5);
+  const [feedbackComments, setFeedbackComments] = useState('');
+  const [isSafetyIssue, setIsSafetyIssue] = useState(false);
+  const [safetyDetails, setSafetyDetails] = useState('');
+  const [submittingFeedback, setSubmittingFeedback] = useState(false);
+
   useEffect(() => {
     loadRecommendations();
     loadReservations();
@@ -52,6 +60,44 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
     }
   };
 
+  const handleCancelReservation = async (reservationId) => {
+    const reason = prompt("Enter cancellation reason:", "Logistics constraints or surplus capacity adjusted.");
+    if (!reason) return;
+    try {
+      await api.cancelReservation(reservationId, reason);
+      setStatusMsg("Reservation cancelled. Inventory restored to donor.");
+      loadReservations();
+      onRefresh();
+    } catch (err) {
+      setStatusMsg(`Cancellation Error: ${err.message}`);
+    }
+  };
+
+  const handleSubmitFeedback = async (e) => {
+    e.preventDefault();
+    if (!feedbackModalReservation) return;
+    setSubmittingFeedback(true);
+    try {
+      await api.submitFeedback({
+        reservation: feedbackModalReservation.id,
+        target_organization: feedbackModalReservation.food_listing_detail?.organization,
+        rating: feedbackRating,
+        comments: feedbackComments,
+        report_safety_issue: isSafetyIssue,
+        safety_issue_details: isSafetyIssue ? safetyDetails : '',
+      });
+      setStatusMsg(isSafetyIssue ? "Feedback and Food Safety Alert submitted to Admin Desk." : "Feedback submitted successfully. Thank you!");
+      setFeedbackModalReservation(null);
+      setFeedbackComments('');
+      setIsSafetyIssue(false);
+      setSafetyDetails('');
+    } catch (err) {
+      setStatusMsg(`Feedback Error: ${err.message}`);
+    } finally {
+      setSubmittingFeedback(false);
+    }
+  };
+
   const filteredListings = listings.filter((l) => {
     const matchesCat = !filterCategory || String(l.category) === String(filterCategory);
     const matchesQuery = !searchQuery || l.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -71,12 +117,17 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
             <span className="text-xs text-emerald-700 font-bold bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-full flex items-center gap-1">
               ✓ Verified Organization
             </span>
+            {currentUser?.organization?.has_cold_storage && (
+              <span className="text-xs text-sky-700 font-bold bg-sky-50 border border-sky-200 px-2.5 py-0.5 rounded-full">
+                ❄️ Cold Storage Certified
+              </span>
+            )}
           </div>
           <h1 className="text-2xl font-black text-slate-900 mt-1">
             {currentUser?.organization?.name || 'Asha Jyothi Children Home & Shelter'}
           </h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            Registered Capacity: <strong className="text-slate-800">{currentUser?.organization?.capacity || 120} portions/day</strong> • Darpan ID: KA/2018/00912
+            Distribution Capacity: <strong className="text-slate-800">{currentUser?.organization?.capacity || 120} portions/day</strong> • Darpan ID: KA/2018/00912
           </p>
         </div>
 
@@ -118,20 +169,20 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
         </div>
       )}
 
-      {/* Tab 1: Smart Algorithmic Matching (Slide 8) */}
+      {/* Tab 1: Smart Algorithmic Matching */}
       {activeTab === 'MATCHES' && (
         <div className="space-y-4">
           <div className="bg-gradient-to-r from-emerald-900 to-slate-900 text-white rounded-2xl p-5 shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
             <div>
               <div className="flex items-center gap-2">
                 <span className="bg-emerald-500/20 text-emerald-400 text-[10px] font-bold px-2 py-0.5 rounded border border-emerald-500/30 uppercase">
-                  Slide 8 Algorithm
+                  Matching Engine
                 </span>
                 <span className="text-xs text-slate-300 font-mono">Score = 0.4*D + 0.3*Q + 0.2*T + 0.1*C</span>
               </div>
               <h3 className="text-lg font-extrabold mt-1">Recommended Surplus Ranked for Your Shelter</h3>
               <p className="text-xs text-slate-300">
-                Ranked by distance suitability (0.4), quantity fit (0.3), pickup urgency (0.2), and distribution capacity (0.1).
+                Ranked by distance suitability (0.4), quantity fit (0.3), pickup urgency (0.2), and recipient capacity (0.1).
               </p>
             </div>
             <button onClick={loadRecommendations} className="px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-semibold whitespace-nowrap">
@@ -151,7 +202,6 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
                     <p className="text-xs text-slate-500">From <strong>{rec.donor_org_name}</strong> • 📍 {rec.pickup_address}</p>
                   </div>
 
-                  {/* Match Score Badge */}
                   <div className="text-right">
                     <div className="text-2xl font-black text-emerald-600">{rec.match_percentage}%</div>
                     <span className="text-[10px] font-bold uppercase text-slate-400">Match Score</span>
@@ -174,7 +224,7 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
                   </div>
                   <div>
                     <span className="text-slate-400 block font-bold">C (Cap)</span>
-                    <strong className="text-slate-800">120 cap</strong>
+                    <strong className="text-slate-800">{currentUser?.organization?.capacity || 120} cap</strong>
                   </div>
                 </div>
 
@@ -277,8 +327,12 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
                 <div key={reservation.id} className="border border-slate-200 rounded-xl p-4 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-bold text-slate-900">Reservation #{reservation.id}: {reservation.food_listing_detail?.title}</span>
-                      <span className="text-[10px] font-bold px-2 py-0.5 rounded uppercase bg-emerald-100 text-emerald-800">
+                      <span className="text-xs font-bold text-slate-900">Claim #{reservation.id}: {reservation.food_listing_detail?.title}</span>
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase ${
+                        reservation.status === 'COMPLETED' ? 'bg-purple-100 text-purple-800' :
+                        reservation.status === 'CANCELLED' ? 'bg-rose-100 text-rose-800' :
+                        'bg-emerald-100 text-emerald-800'
+                      }`}>
                         {reservation.status}
                       </span>
                     </div>
@@ -290,11 +344,30 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
                     </p>
                   </div>
 
-                  <div className="text-right">
-                    <div className="text-xs font-semibold text-slate-500">Recipient Drop-off OTP:</div>
-                    <span className="font-mono text-sm font-black text-sky-800 bg-sky-50 border border-sky-200 px-3 py-1 rounded-lg">
-                      {reservation.pickup?.recipient_otp || '619340'}
-                    </span>
+                  <div className="flex items-center gap-3">
+                    <div className="text-right">
+                      <div className="text-[10px] font-semibold text-slate-500 uppercase">Recipient Delivery OTP</div>
+                      <span className="font-mono text-sm font-black text-sky-800 bg-sky-50 border border-sky-200 px-3 py-1 rounded-lg">
+                        #{reservation.pickup?.recipient_otp || '619340'}
+                      </span>
+                    </div>
+
+                    <div className="flex flex-col gap-1">
+                      {reservation.status === 'CONFIRMED' && (
+                        <button
+                          onClick={() => handleCancelReservation(reservation.id)}
+                          className="px-3 py-1 border border-rose-200 text-rose-600 hover:bg-rose-50 rounded-lg text-xs font-bold"
+                        >
+                          Cancel
+                        </button>
+                      )}
+                      <button
+                        onClick={() => setFeedbackModalReservation(reservation)}
+                        className="px-3 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-bold"
+                      >
+                        Feedback
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -303,7 +376,7 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
         </div>
       )}
 
-      {/* Reserve Food Dialog */}
+      {/* Reserve Food Dialog (Atomic Claim) */}
       {selectedListing && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-slate-100">
@@ -346,6 +419,94 @@ export default function RecipientDashboard({ currentUser, listings, categories, 
                 {reserving ? 'Reserving...' : `Confirm Reservation (${reserveQuantity} pkts)`}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Leave Feedback & Report Food Safety Incident Modal */}
+      {feedbackModalReservation && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-slate-100">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-4">
+              <div>
+                <h3 className="text-base font-black text-slate-900">Delivery Feedback & Incident Desk</h3>
+                <p className="text-xs text-slate-500">For Claim #{feedbackModalReservation.id}</p>
+              </div>
+              <button onClick={() => setFeedbackModalReservation(null)} className="text-slate-400 hover:text-slate-700 text-lg">✕</button>
+            </div>
+
+            <form onSubmit={handleSubmitFeedback} className="space-y-4 text-xs">
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">Quality Rating (1 to 5 Stars):</label>
+                <div className="flex gap-2 text-xl">
+                  {[1, 2, 3, 4, 5].map((star) => (
+                    <button
+                      type="button"
+                      key={star}
+                      onClick={() => setFeedbackRating(star)}
+                      className={star <= feedbackRating ? 'text-amber-400' : 'text-slate-300'}
+                    >
+                      ★
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">Comments & Notes:</label>
+                <textarea
+                  rows="3"
+                  required
+                  value={feedbackComments}
+                  onChange={(e) => setFeedbackComments(e.target.value)}
+                  placeholder="Share feedback on packaging hygiene, timeliness, and food freshness..."
+                  className="w-full px-3 py-2 border border-slate-300 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500"
+                ></textarea>
+              </div>
+
+              {/* Food Safety Flag */}
+              <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl">
+                <label className="flex items-center gap-2 cursor-pointer font-bold text-rose-900">
+                  <input
+                    type="checkbox"
+                    checked={isSafetyIssue}
+                    onChange={(e) => setIsSafetyIssue(e.target.checked)}
+                    className="w-4 h-4 text-rose-600 rounded"
+                  />
+                  <span>Report Food Safety Incident to Admin</span>
+                </label>
+                {isSafetyIssue && (
+                  <div className="mt-2">
+                    <label className="block text-[11px] font-bold text-rose-800 mb-1">Incident Specifics:</label>
+                    <textarea
+                      rows="2"
+                      required={isSafetyIssue}
+                      value={safetyDetails}
+                      onChange={(e) => setSafetyDetails(e.target.value)}
+                      placeholder="Specify packaging damage, off-odor, temperature abuse, or contamination..."
+                      className="w-full px-3 py-1.5 border border-rose-300 rounded-lg text-xs outline-none bg-white"
+                    ></textarea>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setFeedbackModalReservation(null)}
+                  className="px-4 py-2 border border-slate-300 text-slate-700 rounded-xl font-bold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submittingFeedback}
+                  className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold shadow-sm"
+                >
+                  {submittingFeedback ? 'Submitting...' : 'Submit to Desk'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
