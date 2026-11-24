@@ -36,7 +36,7 @@ async function request(endpoint, options = {}) {
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const errorMsg = data.error || data.detail || Object.values(data)[0] || 'Request failed';
+    const errorMsg = data.error || data.detail || (data.safety_error) || (typeof data === 'object' ? Object.values(data)[0] : 'Request failed');
     throw new Error(typeof errorMsg === 'string' ? errorMsg : JSON.stringify(errorMsg));
   }
   return data;
@@ -71,6 +71,12 @@ export const api = {
   }),
   getVerificationRecords: () => request('/organizations/verifications/'),
 
+  // Users (Admin)
+  getUsers: () => request('/users/'),
+  toggleSuspendUser: (userId) => request(`/users/${userId}/toggle_suspend/`, {
+    method: 'POST',
+  }),
+
   // Food Categories & Listings
   getCategories: () => request('/donations/categories/'),
   getListings: (params = '') => request(`/donations/listings/${params}`),
@@ -81,8 +87,12 @@ export const api = {
   }),
   getListingMatches: (id) => request(`/donations/listings/${id}/matches/`),
   getRecommendations: () => request('/donations/listings/recommendations/'),
+  reviewSafetyDeclaration: (listingId, approved, notes) => request(`/donations/listings/${listingId}/review_safety/`, {
+    method: 'POST',
+    body: JSON.stringify({ approved, notes }),
+  }),
 
-  // Reservations
+  // Claims & Reservations
   getReservations: () => request('/reservations/'),
   createReservation: (listingId, quantity) => request('/reservations/', {
     method: 'POST',
@@ -106,6 +116,30 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ otp, qr_token: qrToken }),
   }),
+
+  // Notifications
+  getNotifications: () => request('/notifications/'),
+  getUnreadCount: () => request('/notifications/unread_count/'),
+  markNotificationRead: (id) => request(`/notifications/${id}/mark_read/`, { method: 'POST' }),
+  markAllNotificationsRead: () => request('/notifications/mark_all_read/', { method: 'POST' }),
+
+  // Feedback & Disputes
+  getFeedbacks: () => request('/feedback/'),
+  submitFeedback: (payload) => request('/feedback/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
+  resolveFeedback: (feedbackId, notes) => request(`/feedback/${feedbackId}/resolve/`, {
+    method: 'POST',
+    body: JSON.stringify({ notes }),
+  }),
+
+  // Simulation & Benchmarking
+  runSimulation: (params = {}) => request('/simulation/run/', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  }),
+  getSimulationHistory: () => request('/simulation/'),
 
   // Analytics & Forecast
   getAnalytics: () => request('/analytics/dashboard/'),
