@@ -47,6 +47,12 @@ def score_recipient_for_listing(listing, recipient_org, max_distance_km=25.0):
     if listing.pickup_deadline <= now:
         return None, "Pickup deadline has expired"
 
+    # Storage compatibility check
+    if getattr(listing.category, 'requires_refrigeration', False) and not getattr(recipient_org, 'has_cold_storage', False):
+        storage_str = (listing.storage_condition or '').lower()
+        if 'refrigerat' in storage_str or 'cold' in storage_str or '<5' in storage_str:
+            return None, "Listing requires refrigeration but recipient does not have registered cold storage"
+
     # Calculate distance (km)
     dist_km = haversine_distance(
         listing.latitude, listing.longitude,

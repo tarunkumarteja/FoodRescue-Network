@@ -3,18 +3,26 @@ from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     CustomTokenObtainPairView, RegisterView, UserProfileView,
-    OrganizationViewSet, VerificationRecordListView,
+    UserAdminViewSet, OrganizationViewSet, VerificationRecordListView,
     FoodCategoryListView, FoodListingViewSet, ReservationViewSet,
-    PickupViewSet, FeedbackViewSet, analytics_dashboard,
+    PickupViewSet, DeliveryEventViewSet, FeedbackViewSet,
+    NotificationViewSet, SimulationViewSet, analytics_dashboard,
     demand_forecast_view, seed_demo_data
 )
 
 router = DefaultRouter()
 router.register(r'organizations', OrganizationViewSet, basename='organization')
 router.register(r'donations/listings', FoodListingViewSet, basename='food-listing')
+router.register(r'food-listings', FoodListingViewSet, basename='food-listing-alias')
 router.register(r'reservations', ReservationViewSet, basename='reservation')
+router.register(r'claims', ReservationViewSet, basename='claim-alias')
 router.register(r'deliveries', PickupViewSet, basename='delivery')
+router.register(r'pickups', PickupViewSet, basename='pickup-alias')
+router.register(r'delivery-events', DeliveryEventViewSet, basename='delivery-event')
 router.register(r'feedback', FeedbackViewSet, basename='feedback')
+router.register(r'notifications', NotificationViewSet, basename='notification')
+router.register(r'users', UserAdminViewSet, basename='user-admin')
+router.register(r'simulation', SimulationViewSet, basename='simulation')
 
 urlpatterns = [
     # Auth Endpoints

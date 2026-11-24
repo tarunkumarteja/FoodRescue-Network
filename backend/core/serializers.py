@@ -4,7 +4,8 @@ from django.utils import timezone
 from .models import (
     Organization, FoodCategory, FoodListing, Reservation,
     Pickup, DeliveryEvent, VerificationRecord, Feedback,
-    UserRole, OrgType, VerificationStatus, ReservationStatus
+    Notification, SimulationRun, UserRole, OrgType,
+    VerificationStatus, ReservationStatus
 )
 
 User = get_user_model()
@@ -16,11 +17,12 @@ class OrganizationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Organization
         fields = [
-            'id', 'name', 'organization_type', 'registration_id',
+            'id', 'name', 'organization_type', 'registration_id', 'fssai_license',
             'address', 'city', 'postal_code', 'latitude', 'longitude',
-            'capacity', 'contact_email', 'contact_phone', 'website_url',
-            'verification_status', 'proof_document', 'verified_at',
-            'verified_by', 'verified_by_name', 'created_at', 'updated_at'
+            'capacity', 'has_cold_storage', 'contact_email', 'contact_phone',
+            'website_url', 'verification_status', 'proof_document',
+            'verified_at', 'verified_by', 'verified_by_name',
+            'created_at', 'updated_at'
         ]
         read_only_fields = ['verification_status', 'verified_at', 'verified_by']
 
@@ -44,6 +46,8 @@ class RegisterSerializer(serializers.ModelSerializer):
     organization_address = serializers.CharField(required=False, allow_blank=True, write_only=True)
     organization_capacity = serializers.IntegerField(required=False, default=100, write_only=True)
     registration_id = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    fssai_license = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    has_cold_storage = serializers.BooleanField(required=False, default=False, write_only=True)
 
     class Meta:
         model = User
@@ -51,7 +55,8 @@ class RegisterSerializer(serializers.ModelSerializer):
             'username', 'email', 'password', 'first_name', 'last_name',
             'role', 'phone_number',
             'organization_name', 'organization_type', 'organization_address',
-            'organization_capacity', 'registration_id'
+            'organization_capacity', 'registration_id', 'fssai_license',
+            'has_cold_storage'
         ]
 
     def create(self, validated_data):
@@ -60,6 +65,8 @@ class RegisterSerializer(serializers.ModelSerializer):
         org_address = validated_data.pop('organization_address', '')
         org_capacity = validated_data.pop('organization_capacity', 100)
         reg_id = validated_data.pop('registration_id', '')
+        fssai = validated_data.pop('fssai_license', '')
+        cold_storage = validated_data.pop('has_cold_storage', False)
 
         role = validated_data.get('role', UserRole.RECIPIENT)
         password = validated_data.pop('password')
@@ -74,12 +81,14 @@ class RegisterSerializer(serializers.ModelSerializer):
                 name=org_name,
                 organization_type=org_type or org_type_val,
                 registration_id=reg_id,
+                fssai_license=fssai,
                 address=org_address or 'Bengaluru Central',
                 contact_email=user.email,
                 contact_phone=user.phone_number or '9876543210',
                 capacity=org_capacity,
+                has_cold_storage=cold_storage,
                 verification_status=VerificationStatus.PENDING,
-                proof_document=f"Registration document for {org_name}"
+                proof_document=f"Registration document: {reg_id or fssai or org_name}"
             )
             user.organization = org
             user.save(update_fields=['organization'])
@@ -88,7 +97,7 @@ class RegisterSerializer(serializers.ModelSerializer):
             VerificationRecord.objects.create(
                 organization=org,
                 submitted_by=user,
-                documents_url="Uploaded official registration certificate",
+                documents_url="Uploaded official registration certificate & license",
                 status=VerificationStatus.PENDING
             )
 
@@ -118,7 +127,9 @@ class FoodListingSerializer(serializers.ModelSerializer):
             'unit_of_measure', 'prepared_at', 'best_before_datetime', 'pickup_deadline',
             'storage_condition', 'allergens_present', 'handling_instructions',
             'is_perishable', 'pickup_address', 'latitude', 'longitude',
-            'status', 'is_expired', 'hours_left', 'created_at', 'updated_at'
+            'status', 'food_safety_declaration', 'temperature_at_dispatch',
+            'packaging_type', 'safety_reviewed', 'safety_review_notes',
+            'is_expired', 'hours_left', 'created_at', 'updated_at'
         ]
         read_only_fields = ['donor', 'initial_quantity', 'status']
 
@@ -206,6 +217,10 @@ class ReservationSerializer(serializers.ModelSerializer):
         return obj.recipient.get_full_name() or obj.recipient.username
 
 
+# Domain alias
+ClaimSerializer = ReservationSerializer
+
+
 class VerificationRecordSerializer(serializers.ModelSerializer):
     org_name = serializers.CharField(source='organization.name', read_only=True)
     org_type = serializers.CharField(source='organization.organization_type', read_only=True)
@@ -225,12 +240,30 @@ class VerificationRecordSerializer(serializers.ModelSerializer):
 class FeedbackSerializer(serializers.ModelSerializer):
     author_name = serializers.CharField(source='author.get_full_name', read_only=True)
     target_org_name = serializers.CharField(source='target_organization.name', read_only=True)
+    resolved_by_name = serializers.CharField(source='resolved_by.get_full_name', read_only=True)
 
     class Meta:
         model = Feedback
         fields = [
             'id', 'author', 'author_name', 'target_organization', 'target_org_name',
             'reservation', 'rating', 'comments', 'report_safety_issue',
-            'safety_issue_details', 'is_resolved', 'created_at'
+            'safety_issue_details', 'is_resolved', 'resolution_notes',
+            'resolved_by', 'resolved_by_name', 'resolved_at', 'created_at'
         ]
-        read_only_fields = ['author', 'is_resolved']
+        read_only_fields = ['author', 'is_resolved', 'resolved_by', 'resolved_at']
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = [
+            'id', 'recipient', 'notification_type', 'title', 'message',
+            'related_listing', 'related_reservation', 'is_read', 'created_at'
+        ]
+        read_only_fields = ['recipient', 'created_at']
+
+
+class SimulationRunSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SimulationRun
+        fields = '__all__'

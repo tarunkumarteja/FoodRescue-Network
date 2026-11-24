@@ -51,6 +51,9 @@ class ReservationStatus(models.TextChoices):
     COMPLETED = 'COMPLETED', 'Completed'
 
 
+ClaimStatus = ReservationStatus
+
+
 class PickupStatus(models.TextChoices):
     PENDING = 'PENDING', 'Pending Volunteer Claim'
     ASSIGNED = 'ASSIGNED', 'Volunteer Assigned'
@@ -68,6 +71,17 @@ class DeliveryEventType(models.TextChoices):
     DELIVERY_FAILED = 'DELIVERY_FAILED', 'Delivery Failed / Exception'
 
 
+class NotificationType(models.TextChoices):
+    NEW_MATCH = 'NEW_MATCH', 'New Food Match'
+    CLAIM_CONFIRMED = 'CLAIM_CONFIRMED', 'Claim Confirmed'
+    EXPIRING_SOON = 'EXPIRING_SOON', 'Pickup Window Expiring'
+    PICKUP_ASSIGNED = 'PICKUP_ASSIGNED', 'Volunteer Assigned'
+    FOOD_COLLECTED = 'FOOD_COLLECTED', 'Food Collected'
+    DELIVERY_COMPLETED = 'DELIVERY_COMPLETED', 'Delivery Completed'
+    CANCELLED = 'CANCELLED', 'Reservation Cancelled'
+    SYSTEM = 'SYSTEM', 'System Alert'
+
+
 # ------------------------------------------------------------------------------
 # 1. Organization Entity
 # ------------------------------------------------------------------------------
@@ -79,6 +93,7 @@ class Organization(models.Model):
         default=OrgType.RECIPIENT
     )
     registration_id = models.CharField(max_length=100, blank=True, help_text="Official NGO or Business Registration/Tax ID")
+    fssai_license = models.CharField(max_length=100, blank=True, help_text="FSSAI or Municipal Food Safety License")
     address = models.CharField(max_length=255)
     city = models.CharField(max_length=100, default='Bengaluru')
     postal_code = models.CharField(max_length=20, blank=True)
@@ -87,6 +102,10 @@ class Organization(models.Model):
     capacity = models.PositiveIntegerField(
         default=100,
         help_text="Max packet handling/distribution capacity per day"
+    )
+    has_cold_storage = models.BooleanField(
+        default=False,
+        help_text="Whether recipient facility has refrigeration/freezer units for cold food"
     )
     contact_email = models.EmailField()
     contact_phone = models.CharField(max_length=30)
@@ -107,6 +126,13 @@ class Organization(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'organizations'
+        indexes = [
+            models.Index(fields=['verification_status']),
+            models.Index(fields=['latitude', 'longitude']),
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.organization_type} - {self.verification_status})"
@@ -137,6 +163,9 @@ class User(AbstractUser):
 
     REQUIRED_FIELDS = ['email']
 
+    class Meta:
+        db_table = 'users'
+
     def __str__(self):
         return f"{self.username} [{self.role}]"
 
@@ -150,6 +179,9 @@ class FoodCategory(models.Model):
     requires_refrigeration = models.BooleanField(default=False)
     shelf_life_guidance = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'food_categories'
 
     def __str__(self):
         return self.name
@@ -200,8 +232,23 @@ class FoodListing(models.Model):
         choices=ListingStatus.choices,
         default=ListingStatus.AVAILABLE
     )
+    food_safety_declaration = models.TextField(
+        blank=True,
+        default="I declare that this surplus food was prepared under hygienic conditions, held at proper temperature, unadulterated, and safe for consumption."
+    )
+    temperature_at_dispatch = models.CharField(max_length=50, blank=True, default="Ambient (20-25°C)")
+    packaging_type = models.CharField(max_length=100, blank=True, default="Food-grade thermal containers")
+    safety_reviewed = models.BooleanField(default=True)
+    safety_review_notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'food_listings'
+        indexes = [
+            models.Index(fields=['status', 'pickup_deadline']),
+            models.Index(fields=['latitude', 'longitude']),
+        ]
 
     @property
     def is_expired(self):
@@ -212,7 +259,7 @@ class FoodListing(models.Model):
 
 
 # ------------------------------------------------------------------------------
-# 5. Reservation Entity
+# 5. Reservation / Claim Entity
 # ------------------------------------------------------------------------------
 class Reservation(models.Model):
     food_listing = models.ForeignKey(
@@ -242,8 +289,19 @@ class Reservation(models.Model):
     expires_at = models.DateTimeField()
     cancellation_reason = models.TextField(blank=True)
 
+    class Meta:
+        db_table = 'claims'
+        indexes = [
+            models.Index(fields=['status', 'reserved_at']),
+            models.Index(fields=['food_listing', 'recipient']),
+        ]
+
     def __str__(self):
-        return f"Reservation #{self.id}: {self.quantity_reserved} pkts by {self.recipient.username} ({self.status})"
+        return f"Claim/Reservation #{self.id}: {self.quantity_reserved} pkts by {self.recipient.username} ({self.status})"
+
+
+# Domain alias
+Claim = Reservation
 
 
 # ------------------------------------------------------------------------------
@@ -280,6 +338,13 @@ class Pickup(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    class Meta:
+        db_table = 'pickups'
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['qr_code_token']),
+        ]
+
     def __str__(self):
         return f"Pickup for Reservation #{self.reservation_id} [{self.status}]"
 
@@ -309,6 +374,7 @@ class DeliveryEvent(models.Model):
     proof_of_delivery = models.TextField(blank=True)
 
     class Meta:
+        db_table = 'delivery_events'
         ordering = ['timestamp']
 
     def __str__(self):
@@ -348,12 +414,15 @@ class VerificationRecord(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    class Meta:
+        db_table = 'verification_records'
+
     def __str__(self):
         return f"Verification for {self.organization.name}: {self.status}"
 
 
 # ------------------------------------------------------------------------------
-# 9. Feedback Entity
+# 9. Feedback & Food Safety Incident Reporting Entity
 # ------------------------------------------------------------------------------
 class Feedback(models.Model):
     author = models.ForeignKey(
@@ -380,7 +449,90 @@ class Feedback(models.Model):
     report_safety_issue = models.BooleanField(default=False)
     safety_issue_details = models.TextField(blank=True)
     is_resolved = models.BooleanField(default=False)
+    resolution_notes = models.TextField(blank=True)
+    resolved_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='resolved_feedbacks'
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'feedback'
 
     def __str__(self):
         return f"Feedback by {self.author.username} (Rating: {self.rating}/5)"
+
+
+# ------------------------------------------------------------------------------
+# 10. Notification Entity (In-app alerts & event hooks)
+# ------------------------------------------------------------------------------
+class Notification(models.Model):
+    recipient = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='notifications'
+    )
+    notification_type = models.CharField(
+        max_length=30,
+        choices=NotificationType.choices,
+        default=NotificationType.SYSTEM
+    )
+    title = models.CharField(max_length=200)
+    message = models.TextField()
+    related_listing = models.ForeignKey(
+        FoodListing,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='notifications'
+    )
+    related_reservation = models.ForeignKey(
+        Reservation,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='notifications'
+    )
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'notifications'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['recipient', 'is_read']),
+        ]
+
+    def __str__(self):
+        return f"[{self.notification_type}] {self.title} -> {self.recipient.username}"
+
+
+# ------------------------------------------------------------------------------
+# 11. SimulationRun Entity (Multi-agent simulation & benchmarking history)
+# ------------------------------------------------------------------------------
+class SimulationRun(models.Model):
+    run_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    num_donors = models.PositiveIntegerField(default=5)
+    num_recipients = models.PositiveIntegerField(default=10)
+    num_listings = models.PositiveIntegerField(default=15)
+    successful_matches = models.PositiveIntegerField(default=0)
+    match_rate_pct = models.FloatField(default=0.0)
+    avg_time_to_claim_seconds = models.FloatField(default=0.0)
+    cancelled_pickups = models.PositiveIntegerField(default=0)
+    completed_pickups = models.PositiveIntegerField(default=0)
+    total_quantity_distributed = models.PositiveIntegerField(default=0)
+    co2_saved_kg = models.FloatField(default=0.0)
+    execution_duration_ms = models.FloatField(default=0.0)
+    summary_notes = models.TextField(blank=True)
+
+    class Meta:
+        db_table = 'simulation_runs'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Simulation #{self.run_id} ({self.match_rate_pct}% Match Rate)"

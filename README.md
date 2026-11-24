@@ -103,9 +103,9 @@ Double-click `start_all.bat` in the repository root. This opens both the Django 
 #### 1. Backend:
 ```bash
 cd backend
-py.cmd manage.py migrate
-py.cmd manage.py seed_demo    # Seeds test accounts and Slide 12 demo
-py.cmd manage.py runserver 0.0.0.0:8000
+python manage.py migrate
+python manage.py seed_demo    # Seeds test accounts and Slide 12 demo
+python manage.py runserver 0.0.0.0:8000
 ```
 
 #### 2. Frontend:
@@ -124,7 +124,7 @@ Run the test suite covering the 4-factor matching algorithm, atomic reservation 
 
 ```bash
 cd backend
-py.cmd manage.py test core
+python manage.py test core
 ```
 
 Output:
