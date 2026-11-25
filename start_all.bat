@@ -11,9 +11,9 @@ if %errorlevel% neq 0 (
     )
 )
 
-start "FoodRescue Backend [Django REST]" cmd /k "cd /d %~dp0backend && \"%PYTHON_EXE%\" manage.py runserver 0.0.0.0:8000"
+start "FoodRescue Backend [Django REST]" cmd /k ""%~dp0start_backend.bat""
 timeout /t 3 /nobreak >nul
-start "FoodRescue Frontend [Vite React]" cmd /k "cd /d %~dp0frontend && npm run dev"
+start "FoodRescue Frontend [Vite React]" cmd /k ""%~dp0start_frontend.bat""
 echo Both servers started!
 echo Frontend: http://localhost:5173
 echo Backend API: http://127.0.0.1:8000/api/v1/

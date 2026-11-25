@@ -105,16 +105,19 @@ Double-click `start_all.bat` in the repository root. This opens both the Django 
 cd backend
 python manage.py migrate
 python manage.py seed_demo    # Seeds test accounts and Slide 12 demo
-python manage.py runserver 0.0.0.0:8000
+python manage.py runserver 127.0.0.1:8000
 ```
 
 #### 2. Frontend:
 ```bash
 cd frontend
+npm ci
 npm run dev
 ```
 
 Visit **`http://localhost:5173`** in your browser.
+
+The Windows launch scripts run migrations, seed the local demo data, and install frontend dependencies on first use. Demo seeding is disabled when `DEBUG=False`; the HTTP seed endpoint also requires a staff administrator. For deployments, set `DEBUG=False`, provide a unique `SECRET_KEY`, set `ALLOWED_HOSTS`, and add the frontend URL to `CORS_ALLOWED_ORIGINS`.
 
 ---
 

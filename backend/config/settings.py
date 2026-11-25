@@ -21,18 +21,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # 2. SECURITY & ENVIRONMENT SETTINGS (python-decouple)
 # ------------------------------------------------------------------------------
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config(
-    'SECRET_KEY',
-    default='django-insecure-6xwt3gd=mmhd)510=rmc0k%)vnn)-ap#^kfhq2-5=edxlu02wt'
-)
-
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=True, cast=bool)
+
+# Keep a convenient local default, but never allow it to silently reach production.
+SECRET_KEY = config('SECRET_KEY', default='')
+if not SECRET_KEY:
+    if not DEBUG:
+        from django.core.exceptions import ImproperlyConfigured
+        raise ImproperlyConfigured('Set SECRET_KEY when DEBUG is disabled.')
+    SECRET_KEY = 'django-insecure-local-development-only-change-me'
 
 # Host header validation: comma-separated list of hosts in .env
 ALLOWED_HOSTS = config(
     'ALLOWED_HOSTS',
-    default='127.0.0.1,localhost,testserver,*',
+    default='127.0.0.1,localhost,testserver',
+    cast=Csv()
+)
+CORS_ALLOWED_ORIGINS = config(
+    'CORS_ALLOWED_ORIGINS',
+    default='http://localhost:5173,http://127.0.0.1:5173',
     cast=Csv()
 )
 

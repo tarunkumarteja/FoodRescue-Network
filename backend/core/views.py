@@ -86,6 +86,11 @@ class UserAdminViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = UserProfileSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        if self.request.user.role == UserRole.ADMIN and self.request.user.is_staff:
+            return super().get_queryset()
+        return super().get_queryset().filter(pk=self.request.user.pk)
+
     @action(detail=True, methods=['post'])
     def toggle_suspend(self, request, pk=None):
         if request.user.role != UserRole.ADMIN:
@@ -195,6 +200,13 @@ class FoodListingViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         now = timezone.now()
         qs = FoodListing.objects.all().select_related('donor', 'organization', 'category').order_by('-created_at')
+
+        # Listings can be browsed by authenticated users, but only their donor may edit them.
+        is_admin_review = self.action == 'review_safety' and self.request.user.role == UserRole.ADMIN and self.request.user.is_staff
+        if self.request.method not in ('GET', 'HEAD', 'OPTIONS') and not is_admin_review:
+            if self.request.user.role != UserRole.DONOR:
+                return qs.none()
+            qs = qs.filter(donor=self.request.user)
 
         # Auto-mark expired
         FoodListing.objects.filter(
@@ -312,6 +324,8 @@ class ReservationViewSet(viewsets.ModelViewSet):
             qs = qs.filter(recipient=user)
         elif user.role == UserRole.DONOR:
             qs = qs.filter(food_listing__donor=user)
+        elif user.role != UserRole.ADMIN or not user.is_staff:
+            qs = qs.none()
 
         return qs
 
@@ -446,22 +460,34 @@ class PickupViewSet(viewsets.ModelViewSet):
             'reservation', 'reservation__food_listing', 'reservation__organization', 'volunteer'
         ).prefetch_related('events').order_by('-created_at')
 
-        available_only = self.request.query_params.get('available')
-        if available_only:
-            return qs.filter(status=PickupStatus.PENDING, volunteer__isnull=True)
+        if user.role == UserRole.VOLUNTEER:
+            if self.action == 'claim_task':
+                return qs.filter(Q(status=PickupStatus.PENDING, volunteer__isnull=True) | Q(volunteer=user))
+            if self.request.query_params.get('available'):
+                return qs.filter(status=PickupStatus.PENDING, volunteer__isnull=True)
+            return qs.filter(volunteer=user)
+        if user.role == UserRole.DONOR:
+            return qs.filter(reservation__food_listing__donor=user)
+        if user.role == UserRole.RECIPIENT:
+            return qs.filter(reservation__recipient=user)
+        if user.role != UserRole.ADMIN or not user.is_staff:
+            return qs.none()
 
         return qs
 
     @action(detail=True, methods=['post'])
     def claim_task(self, request, pk=None):
         """Volunteer accepts the pickup and delivery assignment."""
+        if request.user.role != UserRole.VOLUNTEER:
+            return Response({'error': 'Only volunteers can claim delivery tasks.'}, status=status.HTTP_403_FORBIDDEN)
         pickup = self.get_object()
-        if pickup.volunteer and pickup.volunteer != request.user:
-            return Response({'error': 'This delivery is already claimed by another volunteer.'}, status=status.HTTP_409_CONFLICT)
-
-        pickup.volunteer = request.user
-        pickup.status = PickupStatus.ASSIGNED
-        pickup.save()
+        with transaction.atomic():
+            pickup = Pickup.objects.select_for_update().get(pk=pickup.pk)
+            if pickup.status != PickupStatus.PENDING or (pickup.volunteer and pickup.volunteer != request.user):
+                return Response({'error': 'This delivery is already claimed or unavailable.'}, status=status.HTTP_409_CONFLICT)
+            pickup.volunteer = request.user
+            pickup.status = PickupStatus.ASSIGNED
+            pickup.save()
 
         DeliveryEvent.objects.create(
             pickup=pickup,
@@ -741,7 +767,7 @@ def demand_forecast_view(request):
 # 11. Seed Demo Data Endpoint
 # ------------------------------------------------------------------------------
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def seed_demo_data(request):
     """
     Seeds comprehensive realistic demonstration data representing:
@@ -751,6 +777,9 @@ def seed_demo_data(request):
     - The Slide 12 Demo: 50 packets listed -> 30 packets reserved -> 20 packets remaining -> 1 delivery completed
     - Live Map coordinates in Bengaluru
     """
+    if request.user.role != UserRole.ADMIN or not request.user.is_staff:
+        return Response({'error': 'Only platform administrators can seed demo data.'}, status=status.HTTP_403_FORBIDDEN)
+
     now = timezone.now()
 
     # 1. Categories
