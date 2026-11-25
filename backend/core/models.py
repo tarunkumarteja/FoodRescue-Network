@@ -1,4 +1,4 @@
-import random
+import secrets
 import string
 import uuid
 from django.db import models
@@ -8,7 +8,7 @@ from django.utils import timezone
 
 def generate_otp():
     """Generates a secure 6-digit numeric OTP for handover confirmation."""
-    return ''.join(random.choices(string.digits, k=6))
+    return ''.join(secrets.choice(string.digits) for _ in range(6))
 
 
 def generate_qr_token():
